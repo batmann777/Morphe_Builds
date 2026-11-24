@@ -26,21 +26,21 @@ which for each app:
    [De-Vanced Patches](https://github.com/RookieEnough/De-Vanced)
    (downloads verified against the SHA-256 digests GitHub publishes).
 2. Works out the recommended app version for the current patch bundles.
-3. If that combination hasn't been released here yet, downloads the stock
-   APK from the archive.org `jhc-apks` archive (the same source the
-   community builders use; size-verified), patches it with the default
-   patch set, strips every ABI except **arm64-v8a**, verifies the result,
-   and signs it.
-4. Publishes a **GitHub Release** per app, tagged
-   `<app>-<version>-patches-<patchver>-desktop-<desktopver>`, with the
-   patched APK attached (plus Morphe MicroG-RE for the apps that need it
-   for sign-in: YouTube, YT Music, Google Photos).
+3. Downloads the stock APK from the archive.org `jhc-apks` archive (the
+   same source the community builders use; size-verified), patches it with
+   the default patch set, strips every ABI except **arm64-v8a**, verifies
+   the result, and signs it.
+4. Publishes everything in **one combined GitHub Release** per
+   patch-bundle combination, tagged
+   `build-<desktopver>-<morphepatchver>-<devancedver>`, containing all
+   four patched APKs plus a single copy of Morphe MicroG-RE.
 
-If nothing changed for an app, it's skipped. If one app fails (e.g. a new
-recommended version isn't in the stock archive yet), the others still
-publish and the failed one retries on the next daily run. You can also
-trigger a build manually from the **Actions** tab
-(*Build YouTube Morphe → Run workflow*, with an optional force-rebuild).
+Apps already current in the combined release are skipped. If one app
+fails (e.g. a new recommended version isn't in the stock archive yet),
+the others still publish into the release and the failed one retries on
+the next daily run. You can also trigger a build manually from the
+**Actions** tab (*Build YouTube Morphe → Run workflow*, with an optional
+force-rebuild).
 
 ## Install on the phone
 

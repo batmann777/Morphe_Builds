@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-# Daily Morphe multi-app builder.
-# Checks Morphe Desktop + patch bundle releases. For each app, if a release
-# for the current combination does not exist yet in this repo, downloads the
-# recommended stock APK, patches it for arm64-v8a (non-root, default patches)
-# and publishes a GitHub Release.
+# Daily Morphe multi-app builder — ONE combined release.
+# Checks Morphe Desktop + patch bundle releases, resolves the recommended
+# version of each app, patches whatever is new (arm64-v8a, non-root, default
+# patches) and publishes everything in a SINGLE GitHub Release per
+# patch-bundle combination, tagged:
+#   build-<desktopVer>-<morphePatchesVer>-<devancedVer>
 #
 # Apps:
-#   YouTube      com.google.android.youtube             Morphe patches
-#   YT Music     com.google.android.apps.youtube.music  Morphe patches
-#   Reddit       com.reddit.frontpage                   Morphe patches
-#   Google Photos com.google.android.apps.photos        De-Vanced patches
+#   YouTube       com.google.android.youtube             Morphe patches
+#   YT Music      com.google.android.apps.youtube.music  Morphe patches
+#   Reddit        com.reddit.frontpage                   Morphe patches
+#   Google Photos com.google.android.apps.photos         De-Vanced patches
 #                 (Photos is not covered by official Morphe patches)
 set -uo pipefail
 
 ARCH="arm64-v8a"
 FORCE="${FORCE:-false}"
+REPO="${GITHUB_REPOSITORY:-batmann777/Morphe_Builds}"
 FAILED=()
-SUCCEEDED=()
+BUILT=()
 SKIPPED=()
 
 WORK="$(pwd)/.build-work"
@@ -54,7 +56,7 @@ curl -sfL -o "$JAR_NAME" "$JAR_URL" || { echo "ERROR: cannot download $JAR_NAME"
 verify_sha "$JAR_NAME" "$JAR_DIGEST" || { echo "ERROR: jar checksum mismatch"; exit 1; }
 echo "Morphe Desktop: v$DESKTOP_VER"
 
-fetch_bundle() { # fetch_bundle <repo> <json-out> -> prints "<ver> <file>"
+fetch_bundle() { # fetch_bundle <repo> <json-out> -> prints "<ver> <file> <url> <digest>"
   local repo="$1" out="$2"
   api "https://api.github.com/repos/${repo}/releases/latest" > "$out" || return 1
   python3 - "$out" <<'PY'
@@ -80,6 +82,10 @@ curl -sfL -o "$DV_NAME" "$DV_URL" || { echo "ERROR: cannot download $DV_NAME"; e
 verify_sha "$DV_NAME" "$DV_DIGEST" || { echo "ERROR: De-Vanced checksum mismatch"; exit 1; }
 echo "De-Vanced Patches: v$DEVANCED_VER"
 
+TAG="build-${DESKTOP_VER}-${MORPHE_PATCHES_VER}-${DEVANCED_VER}"
+TITLE="Morphe Builds — Desktop v${DESKTOP_VER} · Patches v${MORPHE_PATCHES_VER} · De-Vanced v${DEVANCED_VER}"
+echo "Combined release tag: $TAG"
+
 echo "== Fetching stock archive index (archive.org jhc-apks) =="
 curl -sfL "https://archive.org/metadata/jhc-apks" > jhc.json || { echo "ERROR: cannot fetch archive index"; exit 1; }
 
@@ -94,7 +100,6 @@ for a in d['assets']:
         break
 PY
 read -r MICROG_NAME MICROG_URL < microg-asset.txt
-curl -sfL -o "$MICROG_NAME" "$MICROG_URL" || { echo "ERROR: cannot download MicroG"; exit 1; }
 echo "MicroG-RE: $MICROG_NAME"
 
 echo "== Preparing signing keystore =="
@@ -106,9 +111,30 @@ recommended_version() { # recommended_version <bundle-file> <package>
     | sed -n 's/^[[:space:]]*\([0-9][0-9.]*\).*/\1/p' | head -1
 }
 
-# build_app <slug> <display> <package> <bundle-file> <bundle-ver> <stock-suffix> <attach-microg:yes|no>
-build_app() {
-  local slug="$1" display="$2" pkg="$3" bundle="$4" bundle_ver="$5" suffix="$6" microg="$7"
+echo "== Checking existing combined release =="
+EXISTING_ASSETS=""
+RELEASE_EXISTS="no"
+if api "https://api.github.com/repos/${REPO}/releases/tags/${TAG}" > existing-release.json 2>/dev/null; then
+  RELEASE_EXISTS="yes"
+  EXISTING_ASSETS="$(python3 -c "
+import json
+d = json.load(open('existing-release.json'))
+print('\n'.join(a['name'] for a in d.get('assets', [])))
+")"
+  echo "Release $TAG exists with assets:"
+  echo "$EXISTING_ASSETS"
+else
+  echo "Release $TAG does not exist yet."
+fi
+
+asset_present() { # asset_present <filename>
+  [ "$RELEASE_EXISTS" = "yes" ] && printf '%s\n' "$EXISTING_ASSETS" | grep -qxF "$1"
+}
+
+# build_one <slug> <display> <prefix> <package> <bundle-file> <stock-suffix>
+# On success: sets global OUT_FILE. On skip: returns 2. On failure: returns 1.
+build_one() {
+  local slug="$1" display="$2" prefix="$3" pkg="$4" bundle="$5" suffix="$6"
   echo ""
   echo "######## $display ########"
 
@@ -116,13 +142,13 @@ build_app() {
   ver="$(recommended_version "$bundle" "$pkg")"
   if [ -z "$ver" ]; then echo "ERROR: no recommended version for $pkg"; return 1; fi
   echo "Recommended $display: $ver"
+  eval "VER_${slug}=\"$ver\""
 
-  local tag="${slug}-${ver}-patches-${bundle_ver}-desktop-${DESKTOP_VER}"
-  echo "Release tag: $tag"
-  if [ "$FORCE" != "true" ] && gh release view "$tag" >/dev/null 2>&1; then
-    echo "UP-TO-DATE: $tag already released. Skipping."
+  OUT_FILE="${prefix}-Morphe-${ver}-${ARCH}.apk"
+  if [ "$FORCE" != "true" ] && asset_present "$OUT_FILE"; then
+    echo "UP-TO-DATE: $OUT_FILE already in release $TAG. Skipping."
     SKIPPED+=("$display $ver")
-    return 0
+    return 2
   fi
 
   local stock_path="apks/${pkg}/${pkg}-${ver}-${suffix}"
@@ -149,11 +175,6 @@ else:
   python3 -c "import sys; sys.exit(0 if open('$stock','rb').read(2)==b'PK' else 1)" || { echo "ERROR: stock file is not an APK/bundle"; return 1; }
   echo "Stock OK ($actual bytes)"
 
-  local out
-  out="$(echo "$display" | tr -d ' ')-Morphe-${ver}-${ARCH}.apk"
-  if [ "$display" = "YT Music" ]; then out="YTMusic-Morphe-${ver}-${ARCH}.apk"; fi
-  if [ "$display" = "Google Photos" ]; then out="Photos-Morphe-${ver}-${ARCH}.apk"; fi
-
   java -Xmx6g -jar "$JAR_NAME" patch \
     -p "$bundle" \
     --striplibs "$ARCH" \
@@ -161,10 +182,10 @@ else:
     --keystore-password="morphe-builds" \
     --keystore-entry-password="morphe-builds" \
     --keystore-entry-alias="Morphe" \
-    -o "$out" \
+    -o "$OUT_FILE" \
     "$stock" || { echo "ERROR: patching $display failed"; return 1; }
 
-  python3 - "$out" <<'PY' || { echo "ERROR: patched APK ABI check failed"; return 1; }
+  python3 - "$OUT_FILE" <<'PY' || { echo "ERROR: patched APK ABI check failed"; return 1; }
 import zipfile, sys
 z = zipfile.ZipFile(sys.argv[1])
 abis = sorted({n.split('/')[1] for n in z.namelist() if n.startswith('lib/')})
@@ -172,68 +193,143 @@ print('Patched APK lib ABIs:', abis)
 sys.exit(0 if all(a == 'arm64-v8a' for a in abis) else 1)
 PY
 
-  local out_sha out_size
-  out_sha="$(sha256sum "$out" | awk '{print $1}')"
-  out_size="$(du -h "$out" | cut -f1)"
-  echo "Patched: $out ($out_size, sha256 $out_sha)"
-
-  local notes="notes-${slug}.md"
-  {
-    echo "## $display Morphe $ver — arm64-v8a, non-root"
-    echo ""
-    echo "Built automatically by the daily Morphe builder."
-    echo ""
-    echo "| Component | Version |"
-    echo "|---|---|"
-    echo "| $display (stock, recommended) | $ver |"
-    if [ "$bundle" = "$MPP_NAME" ]; then
-      echo "| Morphe Patches | v$bundle_ver |"
-    else
-      echo "| De-Vanced Patches | v$bundle_ver |"
-    fi
-    echo "| Morphe Desktop (CLI) | v$DESKTOP_VER |"
-    echo "| Architecture | arm64-v8a only (other ABIs stripped) |"
-    echo ""
-    echo "**Patched APK:** \`$out\` ($out_size)"
-    echo "**SHA-256:** \`$out_sha\`"
-    echo ""
-    echo "### Install"
-    if [ "$microg" = "yes" ]; then
-      echo "1. Install \`$MICROG_NAME\` first (Morphe MicroG-RE) — required to sign in on a non-root phone."
-      echo "2. Install \`$out\`."
-      echo "3. Open the app and sign in via MicroG."
-    else
-      echo "1. Install \`$out\`."
-      echo "2. Open the app and sign in with your account as usual."
-    fi
-    echo ""
-    echo "All builds are signed with the same keystore (see \`keystore/\` in this repo), so new releases install over previous ones."
-  } > "$notes"
-
-  local assets=("$out")
-  if [ "$microg" = "yes" ]; then assets+=("$MICROG_NAME"); fi
-
-  if gh release view "$tag" >/dev/null 2>&1; then
-    gh release upload "$tag" "${assets[@]}" --clobber || return 1
-    gh release edit "$tag" --title "$display Morphe $ver (patches v$bundle_ver)" --notes-file "$notes" || return 1
-  else
-    gh release create "$tag" "${assets[@]}" \
-      --title "$display Morphe $ver (patches v$bundle_ver)" \
-      --notes-file "$notes" || return 1
-  fi
-  echo "PUBLISHED: $tag"
-  SUCCEEDED+=("$display $ver")
+  echo "Patched: $OUT_FILE ($(du -h "$OUT_FILE" | cut -f1))"
+  BUILT+=("$display $ver")
   return 0
 }
 
-build_app "yt"     "YouTube"       "com.google.android.youtube"             "$MPP_NAME" "$MORPHE_PATCHES_VER" "all.apk"       "yes" || FAILED+=("YouTube")
-build_app "ytmusic" "YT Music"      "com.google.android.apps.youtube.music" "$MPP_NAME" "$MORPHE_PATCHES_VER" "arm64-v8a.apk" "yes" || FAILED+=("YT Music")
-build_app "reddit" "Reddit"        "com.reddit.frontpage"                  "$MPP_NAME" "$MORPHE_PATCHES_VER" "all.apkm"      "no"  || FAILED+=("Reddit")
-build_app "photos" "Google Photos" "com.google.android.apps.photos"        "$DV_NAME"  "$DEVANCED_VER"       "all.apk"       "yes" || FAILED+=("Google Photos")
+UPLOADS=()
+STALE_PREFIXES=()
+
+run_app() { # run_app <slug> <display> <prefix> <package> <bundle> <suffix>
+  local slug="$1" display="$2" prefix="$3"
+  build_one "$@"
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    UPLOADS+=("$OUT_FILE")
+    STALE_PREFIXES+=("$prefix")
+  elif [ $rc -eq 1 ]; then
+    FAILED+=("$display")
+  fi
+}
+
+run_app "yt"     "YouTube"       "YouTube" "com.google.android.youtube"             "$MPP_NAME" "all.apk"
+run_app "ytmusic" "YT Music"      "YTMusic" "com.google.android.apps.youtube.music" "$MPP_NAME" "arm64-v8a.apk"
+run_app "reddit" "Reddit"        "Reddit"  "com.reddit.frontpage"                  "$MPP_NAME" "all.apkm"
+run_app "photos" "Google Photos" "Photos"  "com.google.android.apps.photos"        "$DV_NAME"  "all.apk"
+
+# MicroG goes into the combined release once.
+MICROG_STALE="no"
+if [ "$FORCE" = "true" ] || ! asset_present "$MICROG_NAME"; then
+  curl -sfL -o "$MICROG_NAME" "$MICROG_URL" || { echo "ERROR: cannot download MicroG"; FAILED+=("MicroG"); }
+  if [ -f "$MICROG_NAME" ]; then
+    UPLOADS+=("$MICROG_NAME")
+    MICROG_STALE="yes"
+  fi
+else
+  echo "MicroG $MICROG_NAME already in release. Skipping."
+fi
+
+if [ "${#UPLOADS[@]}" -eq 0 ] && [ "${#FAILED[@]}" -eq 0 ]; then
+  echo ""
+  echo "UP-TO-DATE: combined release $TAG already has every current app. Nothing to do."
+  exit 0
+fi
+
+if [ "${#UPLOADS[@]}" -eq 0 ]; then
+  echo ""
+  echo "ERROR: every build failed; not touching the release."
+  exit 1
+fi
+
+echo ""
+echo "== Publishing combined release $TAG =="
+if [ "$RELEASE_EXISTS" != "yes" ]; then
+  gh release create "$TAG" --title "$TITLE" --notes "Building…" || { echo "ERROR: cannot create release"; exit 1; }
+  RELEASE_EXISTS="yes"
+fi
+
+# Remove stale assets for rebuilt apps (older versions of the same app).
+if [ "$RELEASE_EXISTS" = "yes" ] && [ -n "$EXISTING_ASSETS" ]; then
+  while IFS= read -r old; do
+    [ -z "$old" ] && continue
+    for p in "${STALE_PREFIXES[@]}"; do
+      case "$old" in
+        "${p}-Morphe-"*)
+          keep="no"
+          for u in "${UPLOADS[@]}"; do [ "$u" = "$old" ] && keep="yes"; done
+          if [ "$keep" = "no" ]; then
+            echo "Deleting stale asset: $old"
+            gh release delete-asset "$TAG" "$old" --yes 2>/dev/null || gh release delete-asset "$TAG" "$old" || true
+          fi
+          ;;
+      esac
+    done
+    if [ "$MICROG_STALE" = "yes" ]; then
+      case "$old" in
+        microg-*.apk)
+          if [ "$old" != "$MICROG_NAME" ]; then
+            echo "Deleting stale MicroG asset: $old"
+            gh release delete-asset "$TAG" "$old" --yes 2>/dev/null || gh release delete-asset "$TAG" "$old" || true
+          fi
+          ;;
+      esac
+    fi
+  done <<< "$EXISTING_ASSETS"
+fi
+
+gh release upload "$TAG" "${UPLOADS[@]}" --clobber || { echo "ERROR: asset upload failed"; exit 1; }
+
+echo "== Writing combined release notes =="
+api "https://api.github.com/repos/${REPO}/releases/tags/${TAG}" > final-release.json || { echo "ERROR: cannot read back release"; exit 1; }
+python3 - > notes.md <<PY
+import json
+d = json.load(open('final-release.json'))
+assets = {a['name']: a for a in d.get('assets', [])}
+apps = [
+    ("YouTube", "Morphe Patches v$MORPHE_PATCHES_VER", "${VER_yt:-}"),
+    ("YT Music", "Morphe Patches v$MORPHE_PATCHES_VER", "${VER_ytmusic:-}"),
+    ("Reddit", "Morphe Patches v$MORPHE_PATCHES_VER", "${VER_reddit:-}"),
+    ("Google Photos", "De-Vanced Patches v$DEVANCED_VER", "${VER_photos:-}"),
+]
+prefix = {"YouTube": "YouTube", "YT Music": "YTMusic", "Reddit": "Reddit", "Google Photos": "Photos"}
+print("## Morphe Builds — all apps, one release")
+print()
+print("Patched APKs for **arm64-v8a, non-root**, built automatically by the daily Morphe builder.")
+print()
+print(f"| Component | Version |")
+print(f"|---|---|")
+print(f"| Morphe Desktop (CLI) | v$DESKTOP_VER |")
+print(f"| Morphe Patches | v$MORPHE_PATCHES_VER |")
+print(f"| De-Vanced Patches (Photos) | v$DEVANCED_VER |")
+print()
+print("| App | Version | File | Size | SHA-256 |")
+print("|---|---|---|---|---|")
+for display, src, ver in apps:
+    name = f"{prefix[display]}-Morphe-{ver}-arm64-v8a.apk"
+    a = assets.get(name)
+    if a:
+        size = f"{a['size']/1e6:.1f} MB"
+        digest = (a.get('digest') or '').removeprefix('sha256:')
+        print(f"| {display} | {ver} | \`{name}\` | {size} | \`{digest}\` |")
+    else:
+        print(f"| {display} | {ver} | build pending/failed — retried on the next daily run | | |")
+mg = assets.get("$MICROG_NAME")
+if mg:
+    print(f"| MicroG-RE | sign-in for non-root | \`$MICROG_NAME\` | {mg['size']/1e6:.1f} MB | \`{(mg.get('digest') or '').removeprefix('sha256:')}\` |")
+print()
+print("### Install")
+print("- **YouTube / YT Music / Google Photos:** install MicroG-RE first, then the app's APK, then sign in via MicroG.")
+print("- **Reddit:** install the APK and sign in as usual.")
+print()
+print("All builds are signed with the same keystore (see \`keystore/\` in this repo), so new releases install over previous ones.")
+PY
+gh release edit "$TAG" --title "$TITLE" --notes-file notes.md || { echo "ERROR: cannot update release notes"; exit 1; }
 
 echo ""
 echo "================ SUMMARY ================"
-echo "Published: ${SUCCEEDED[*]:-none}"
+echo "Release: $TAG"
+echo "Built & uploaded: ${BUILT[*]:-none}"
 echo "Up-to-date: ${SKIPPED[*]:-none}"
 echo "Failed: ${FAILED[*]:-none}"
 if [ "${#FAILED[@]}" -gt 0 ]; then exit 1; fi
