@@ -140,7 +140,8 @@ else:
     echo "ERROR: stock file not in archive yet: $stock_path (daily run retries tomorrow)"
     return 1
   fi
-  local stock="stock-${slug}-${ver}"
+  # Keep the real extension (.apk/.apkm): the patcher detects bundles by extension.
+  local stock="stock-${slug}-${ver}.${suffix##*.}"
   curl -sfL -o "$stock" "https://archive.org/download/jhc-apks/${stock_path}" || { echo "ERROR: stock download failed"; return 1; }
   local actual
   actual="$(stat -c%s "$stock")"
