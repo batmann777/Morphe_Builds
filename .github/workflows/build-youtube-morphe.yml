@@ -5,7 +5,7 @@ name: Build YouTube Morphe
 # as a GitHub Release only when a new combination has not been built yet.
 on:
   schedule:
-    - cron: "30 3 * * *" # 03:30 UTC = 09:00 IST daily
+    - cron: "30 18 * * *" # 18:30 UTC = 00:00 IST daily
   push:
     branches: [main]
     paths:
