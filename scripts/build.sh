@@ -12,6 +12,10 @@
 #   Reddit        com.reddit.frontpage                   Morphe patches
 #   Google Photos com.google.android.apps.photos         De-Vanced patches
 #                 (Photos is not covered by official Morphe patches)
+#   Gboard        com.google.android.inputmethod.latin   PixelBoard patches
+#                 (stock .apkm is self-hosted in this repo under a
+#                  stock-gboard-<version> release: APK mirrors block CI
+#                  downloads behind Cloudflare)
 set -uo pipefail
 
 ARCH="arm64-v8a"
@@ -82,8 +86,14 @@ curl -sfL -o "$DV_NAME" "$DV_URL" || { echo "ERROR: cannot download $DV_NAME"; e
 verify_sha "$DV_NAME" "$DV_DIGEST" || { echo "ERROR: De-Vanced checksum mismatch"; exit 1; }
 echo "De-Vanced Patches: v$DEVANCED_VER"
 
-TAG="build-${DESKTOP_VER}-${MORPHE_PATCHES_VER}-${DEVANCED_VER}"
-TITLE="Morphe Builds — Desktop v${DESKTOP_VER} · Patches v${MORPHE_PATCHES_VER} · De-Vanced v${DEVANCED_VER}"
+echo "== Checking PixelBoard Patches (for Gboard) =="
+read -r PB_VER PB_NAME PB_URL PB_DIGEST < <(fetch_bundle "Akshayykadam/PixelBoard" pixelboard.json) || { echo "ERROR: cannot fetch PixelBoard patches"; exit 1; }
+curl -sfL -o "$PB_NAME" "$PB_URL" || { echo "ERROR: cannot download $PB_NAME"; exit 1; }
+verify_sha "$PB_NAME" "$PB_DIGEST" || { echo "ERROR: PixelBoard checksum mismatch"; exit 1; }
+echo "PixelBoard Patches: v$PB_VER"
+
+TAG="build-${DESKTOP_VER}-${MORPHE_PATCHES_VER}-${DEVANCED_VER}-${PB_VER}"
+TITLE="Morphe Builds — Desktop v${DESKTOP_VER} · Patches v${MORPHE_PATCHES_VER} · De-Vanced v${DEVANCED_VER} · PixelBoard v${PB_VER}"
 echo "Combined release tag: $TAG"
 
 echo "== Fetching stock archive index (archive.org jhc-apks) =="
@@ -131,15 +141,39 @@ asset_present() { # asset_present <filename>
   [ "$RELEASE_EXISTS" = "yes" ] && printf '%s\n' "$EXISTING_ASSETS" | grep -qxF "$1"
 }
 
-# build_one <slug> <display> <prefix> <package> <bundle-file> <stock-suffix>
+# Gboard: PixelBoard lists several compatible versions ascending and only the
+# newest (non-beta) is actually supported — resolve the highest numeric one.
+recommended_version_gboard() {
+  java -jar "$JAR_NAME" list-versions --patches="$PB_NAME" -f com.google.android.inputmethod.latin 2>/dev/null \
+  | python3 -c "
+import sys, re
+best = None
+for line in sys.stdin:
+    m = re.match(r'\s*(\d+(?:\.\d+)+)(?:-([a-z]+))?', line)
+    if not m or m.group(2) == 'beta':
+        continue
+    key = tuple(int(x) for x in m.group(1).split('.'))
+    if best is None or key > best[0]:
+        best = (key, m.group(1))
+print(best[1] if best else '')
+"
+}
+
+# build_one <slug> <display> <prefix> <package> <bundle-file> <stock-suffix> [stock-source]
+# stock-source: "jhc" (default, archive.org) or "ghstock" (this repo's
+# stock-<slug>-<ver> release, used for Gboard).
 # On success: sets global OUT_FILE. On skip: returns 2. On failure: returns 1.
 build_one() {
-  local slug="$1" display="$2" prefix="$3" pkg="$4" bundle="$5" suffix="$6"
+  local slug="$1" display="$2" prefix="$3" pkg="$4" bundle="$5" suffix="$6" source="${7:-jhc}"
   echo ""
   echo "######## $display ########"
 
   local ver
-  ver="$(recommended_version "$bundle" "$pkg")"
+  if [ "$slug" = "gboard" ]; then
+    ver="$(recommended_version_gboard)"
+  else
+    ver="$(recommended_version "$bundle" "$pkg")"
+  fi
   if [ -z "$ver" ]; then echo "ERROR: no recommended version for $pkg"; return 1; fi
   echo "Recommended $display: $ver"
   eval "VER_${slug}=\"$ver\""
@@ -151,9 +185,36 @@ build_one() {
     return 2
   fi
 
-  local stock_path="apks/${pkg}/${pkg}-${ver}-${suffix}"
-  local expected
-  expected="$(python3 -c "
+  # Keep the real extension (.apk/.apkm): the patcher detects bundles by extension.
+  local stock="stock-${slug}-${ver}.${suffix##*.}"
+  local expected=""
+  if [ "$source" = "ghstock" ]; then
+    local stock_tag="stock-${slug}-${ver}"
+    if ! api "https://api.github.com/repos/${REPO}/releases/tags/${stock_tag}" > "stock-release-${slug}.json" 2>/dev/null; then
+      echo "ERROR: no self-hosted stock release '$stock_tag' in $REPO yet."
+      echo "       Gboard stock cannot be fetched from public mirrors by CI (Cloudflare)."
+      echo "       Add a release tagged $stock_tag with the stock .apkm asset, then the next run builds it."
+      return 1
+    fi
+    local asset_url
+    read -r asset_url expected < <(python3 -c "
+import json
+d = json.load(open('stock-release-${slug}.json'))
+for a in d.get('assets', []):
+    if a['name'].endswith('.apkm') or a['name'].endswith('.apk'):
+        print(a['url'], a['size']); break
+else:
+    print('', '')
+")
+    if [ -z "$asset_url" ]; then echo "ERROR: stock release $stock_tag has no .apk/.apkm asset"; return 1; fi
+    if [ -n "${GH_TOKEN:-}" ]; then
+      curl -sfL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o "$stock" "$asset_url" || { echo "ERROR: stock download failed"; return 1; }
+    else
+      curl -sfL -H "Accept: application/octet-stream" -o "$stock" "$asset_url" || { echo "ERROR: stock download failed"; return 1; }
+    fi
+  else
+    local stock_path="apks/${pkg}/${pkg}-${ver}-${suffix}"
+    expected="$(python3 -c "
 import json
 d = json.load(open('jhc.json'))
 for f in d.get('files', []):
@@ -162,13 +223,12 @@ for f in d.get('files', []):
 else:
     print('')
 ")"
-  if [ -z "$expected" ]; then
-    echo "ERROR: stock file not in archive yet: $stock_path (daily run retries tomorrow)"
-    return 1
+    if [ -z "$expected" ]; then
+      echo "ERROR: stock file not in archive yet: $stock_path (daily run retries tomorrow)"
+      return 1
+    fi
+    curl -sfL -o "$stock" "https://archive.org/download/jhc-apks/${stock_path}" || { echo "ERROR: stock download failed"; return 1; }
   fi
-  # Keep the real extension (.apk/.apkm): the patcher detects bundles by extension.
-  local stock="stock-${slug}-${ver}.${suffix##*.}"
-  curl -sfL -o "$stock" "https://archive.org/download/jhc-apks/${stock_path}" || { echo "ERROR: stock download failed"; return 1; }
   local actual
   actual="$(stat -c%s "$stock")"
   if [ "$actual" != "$expected" ]; then echo "ERROR: stock size mismatch: $actual != $expected"; return 1; fi
@@ -217,6 +277,7 @@ run_app "yt"     "YouTube"       "YouTube" "com.google.android.youtube"         
 run_app "ytmusic" "YT Music"      "YTMusic" "com.google.android.apps.youtube.music" "$MPP_NAME" "arm64-v8a.apk"
 run_app "reddit" "Reddit"        "Reddit"  "com.reddit.frontpage"                  "$MPP_NAME" "all.apkm"
 run_app "photos" "Google Photos" "Photos"  "com.google.android.apps.photos"        "$DV_NAME"  "all.apk"
+run_app "gboard" "Gboard"        "Gboard"  "com.google.android.inputmethod.latin"  "$PB_NAME"  "apkm"        "ghstock"
 
 # MicroG goes into the combined release once.
 MICROG_STALE="no"
@@ -291,8 +352,9 @@ apps = [
     ("YT Music", "Morphe Patches v$MORPHE_PATCHES_VER", "${VER_ytmusic:-}"),
     ("Reddit", "Morphe Patches v$MORPHE_PATCHES_VER", "${VER_reddit:-}"),
     ("Google Photos", "De-Vanced Patches v$DEVANCED_VER", "${VER_photos:-}"),
+    ("Gboard", "PixelBoard Patches v$PB_VER", "${VER_gboard:-}"),
 ]
-prefix = {"YouTube": "YouTube", "YT Music": "YTMusic", "Reddit": "Reddit", "Google Photos": "Photos"}
+prefix = {"YouTube": "YouTube", "YT Music": "YTMusic", "Reddit": "Reddit", "Google Photos": "Photos", "Gboard": "Gboard"}
 print("## Morphe Builds — all apps, one release")
 print()
 print("Patched APKs for **arm64-v8a, non-root**, built automatically by the daily Morphe builder.")
@@ -302,6 +364,7 @@ print(f"|---|---|")
 print(f"| Morphe Desktop (CLI) | v$DESKTOP_VER |")
 print(f"| Morphe Patches | v$MORPHE_PATCHES_VER |")
 print(f"| De-Vanced Patches (Photos) | v$DEVANCED_VER |")
+print(f"| PixelBoard Patches (Gboard) | v$PB_VER |")
 print()
 print("| App | Version | File | Size | SHA-256 |")
 print("|---|---|---|---|---|")
@@ -321,6 +384,7 @@ print()
 print("### Install")
 print("- **YouTube / YT Music / Google Photos:** install MicroG-RE first, then the app's APK, then sign in via MicroG.")
 print("- **Reddit:** install the APK and sign in as usual.")
+print("- **Gboard (PixelBoard):** install the APK, then enable PixelBoard under Settings > System > Languages & input > On-screen keyboard. It installs alongside the official Gboard as a separate keyboard (package com.akshaykadam.pixelboard); no MicroG needed.")
 print()
 print("All builds are signed with the same keystore (see \`keystore/\` in this repo), so new releases install over previous ones.")
 PY
