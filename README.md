@@ -17,7 +17,7 @@ Versions are not hardcoded — the builder asks the Morphe CLI
 ## How it works
 
 A GitHub Actions workflow (`.github/workflows/build-youtube-morphe.yml`) runs
-**daily at 09:00 IST** and executes [`scripts/build.sh`](scripts/build.sh),
+**daily at 12:00 AM IST (midnight)** and executes [`scripts/build.sh`](scripts/build.sh),
 which for each app:
 
 1. Checks the latest stable releases of
